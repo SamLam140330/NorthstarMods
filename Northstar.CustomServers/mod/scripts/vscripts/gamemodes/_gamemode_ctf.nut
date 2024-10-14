@@ -19,6 +19,8 @@ struct {
 	array<entity> militiaCaptureAssistList
 } file
 
+const float CTF_FLAG_MAX_SPAWN_DISTANCE = 2000.0
+
 
 
 
@@ -46,7 +48,6 @@ void function CaptureTheFlag_Init()
 	CaptureTheFlagShared_Init()
 	
 	SetSwitchSidesBased( true )
-	SetSuddenDeathBased( true )
 	
 	SetShouldUseRoundWinningKillReplay( true )
 	SetRoundWinningKillReplayKillClasses( false, false )
@@ -68,15 +69,17 @@ void function CaptureTheFlag_Init()
 	
 	AddSpawnpointValidationRule( VerifyCTFSpawnpoint )
 	
-	RegisterSignal( "ResetDropTimeout" )
+	RegisterSignal( "CTF_GrabbedFlag" )
 	
 	level.teamFlags <- {}
 	
 	ScoreEvent_SetEarnMeterValues( "KillPilot", 0.05, 0.20 )
+	ScoreEvent_SetEarnMeterValues( "PilotAssist", 0.05, 0.10 )
 	ScoreEvent_SetEarnMeterValues( "Headshot", 0.0, 0.02 )
 	ScoreEvent_SetEarnMeterValues( "FirstStrike", 0.0, 0.05 )
 	ScoreEvent_SetEarnMeterValues( "KillTitan", 0.0, 0.25 )
 	ScoreEvent_SetEarnMeterValues( "PilotBatteryStolen", 0.0, 0.35 )
+	ScoreEvent_SetEarnMeterValues( "PilotBatteryApplied", 0.0, 0.35 )
 	
 	ScoreEvent_SetEarnMeterValues( "FlagCarrierKill", 0.0, 0.20 )
 	ScoreEvent_SetEarnMeterValues( "FlagTaken", 0.0, 0.10 )
@@ -144,6 +147,7 @@ void function CreateFlags()
 		flag.SetModel( CTF_FLAG_MODEL )
 		flag.SetOrigin( spawn.GetOrigin() + < 0, 0, base.GetBoundingMaxs().z * 2 > )
 		flag.SetVelocity( < 0, 0, 1 > )
+		flag.kv.gravity = 0.8
 		
 		flag.s.canTake <- true
 		
@@ -249,7 +253,16 @@ bool function VerifyCTFSpawnpoint( entity spawnpoint, int team )
 			enemyFlagSpot = spawn.GetOrigin()
 	}
 	
-	if( Distance2D( spawnpoint.GetOrigin(), allyFlagSpot ) > Distance2D( spawnpoint.GetOrigin(), enemyFlagSpot ) )
+	float allyFlagDistance = Distance2D( spawnpoint.GetOrigin(), allyFlagSpot )
+	float enemyFlagDistance = Distance2D( spawnpoint.GetOrigin(), enemyFlagSpot )
+
+	if( GetMapName() == "mp_drydock" || GetMapName() == "mp_thaw" ) // Restrict spawns for those two maps due to some spawns being very far away
+	{
+		if( allyFlagDistance > CTF_FLAG_MAX_SPAWN_DISTANCE )
+			return false
+	}
+	
+	if( allyFlagDistance > enemyFlagDistance )
 		return false
 	
 	return true
@@ -374,7 +387,7 @@ bool function OnFlagCollected( entity player, entity flag )
 void function GiveFlag( entity player, entity flag )
 {
 	print( player + " picked up the flag!" )
-	flag.Signal( "ResetDropTimeout" )
+	thread FlagSignalGrab_Threaded( flag ) // Delay this signal so it prevents race conditions when flag drops and gets picked up in the same frame
 
 	flag.SetParent( player, "FLAG" )
 	if( GetCurrentPlaylistVarInt( "phase_shift_drop_flag", 0 ) == 1 )
@@ -394,6 +407,13 @@ void function GiveFlag( entity player, entity flag )
 	EmitSoundOnEntityToTeam( flag, "UI_CTF_3P_EnemyGrabFlag", flag.GetTeam() )
 	
 	SetFlagStateForTeam( flag.GetTeam(), eFlagState.Away ) // used for held
+}
+
+void function FlagSignalGrab_Threaded( entity flag )
+{
+	flag.EndSignal( "OnDestroy" )
+	WaitFrame()
+	flag.Signal( "CTF_GrabbedFlag" )
 }
 
 void function CaptureFlag( entity player, entity flag )
@@ -470,7 +490,7 @@ void function DropFlag( entity player, bool realDrop = true )
 	
 	if( !IsValid( flag ) || flag.GetParent() != player )
 		return
-		
+	
 	print( player + " dropped the flag!" )
 	
 	flag.ClearParent()
@@ -487,7 +507,6 @@ void function DropFlag( entity player, bool realDrop = true )
 
 		if ( player.GetTeam() == TEAM_IMC && !file.imcCaptureAssistList.contains( player ) )
 			file.imcCaptureAssistList.append( player )
-		
 		else if( !file.militiaCaptureAssistList.contains( player ) )
 			file.militiaCaptureAssistList.append( player )
 
@@ -523,24 +542,41 @@ void function ResetFlag( entity flag )
 	
 	SetFlagStateForTeam( flag.GetTeam(), eFlagState.None )
 	
-	flag.Signal( "ResetDropTimeout" )
+	flag.Signal( "CTF_ReturnedFlag" )
 }
 
 void function FlagProximityTracker( entity flag )
 {
 	flag.EndSignal( "OnDestroy" )
 	
-	array < entity > playerInsidePerimeter
+	array< entity > playerInsidePerimeter
 	while( true )
 	{
 		if( !playerInsidePerimeter.len() )
 			ArrayRemoveDead( playerInsidePerimeter )
 		
+		if ( GetCurrentPlaylistVarInt( "ctf_flag_instant_return_in_triggers", 0 ) == 1 )
+		{
+			array< entity > instantReturnTriggers = GetEntArrayByClass_Expensive( "trigger_out_of_bounds" )
+			instantReturnTriggers.extend( GetEntArrayByClass_Expensive( "trigger_hurt" ) )
+			foreach( trigger in instantReturnTriggers )
+			{
+				if( trigger.ContainsPoint( flag.GetOrigin() + < 0, 0, 8 > ) && !IsAlive( flag.GetParent() ) )
+					ResetFlag( flag )
+			}
+		}
+
 		foreach ( player in GetPlayerArrayOfTeam_Alive( flag.GetTeam() ) )
 		{
 			if ( Distance( player.GetOrigin(), flag.GetOrigin() ) < CTF_GetFlagReturnRadius() )
 			{
-				if ( FlagIngoresPlayerTitans( player ) || player.GetTeam() != flag.GetTeam() || IsFlagHome( flag ) || flag.GetParent() != null || player.IsPhaseShifted() )
+				if ( FlagIngoresPlayerTitans( player ) || player.GetTeam() != flag.GetTeam() )
+					continue
+				
+				if ( IsFlagHome( flag ) || flag.GetParent() != null || player.IsPhaseShifted() )
+					continue
+				
+				if ( IsPlayerDisembarking( player ) || IsPlayerEmbarking( player ) )
 					continue
 				
 				if( playerInsidePerimeter.contains( player ) )
@@ -578,15 +614,15 @@ void function TryReturnFlag( entity player, entity flag )
 	})
 	
 	flag.EndSignal( "CTF_ReturnedFlag" )
+	flag.EndSignal( "CTF_GrabbedFlag" )
 	flag.EndSignal( "OnDestroy" )
 	
 	player.EndSignal( "CTF_LeftReturnTriggerArea" )
 	player.EndSignal( "OnDeath" )
 	player.EndSignal( "OnDestroy" )
+	player.EndSignal( "StartPhaseShift" )
 	
 	wait CTF_GetFlagReturnTime()
-	
-	ResetFlag( flag )
 	
 	MessageToTeam( flag.GetTeam(), eEventNotifications.PlayerReturnedFriendlyFlag, null, player )
 	EmitSoundOnEntityToTeam( flag, "UI_CTF_3P_TeamReturnsFlag", flag.GetTeam() )
@@ -607,6 +643,7 @@ void function TryReturnFlag( entity player, entity flag )
 	EmitSoundOnEntityOnlyToPlayer( player, player, "UI_CTF_1P_ReturnsFlag" )
 	PlayFactionDialogueToTeam( "ctf_flagReturnedEnemy", GetOtherTeam( flag.GetTeam() ) )
 	
+	ResetFlag( flag )
 	flag.Signal( "CTF_ReturnedFlag" )
 }
 
@@ -673,12 +710,13 @@ void function TransferFlagFromTitan( entity pilot, entity titan )
 void function TrackFlagDropTimeout( entity flag )
 {
 	flag.EndSignal( "CTF_ReturnedFlag" )
-	flag.EndSignal( "ResetDropTimeout" )
+	flag.EndSignal( "CTF_GrabbedFlag" )
 	flag.EndSignal( "OnDestroy" )
 	
 	wait CTF_GetDropTimeout()
 	
-	ResetFlag( flag )
+	if( !IsValidPlayer( flag.GetParent() ) ) // The drop timeout sometimes triggers when players are holding it, this ensures it will stay with players if so
+		ResetFlag( flag )
 }
 
 bool function FlagIngoresPlayerTitans( entity player )

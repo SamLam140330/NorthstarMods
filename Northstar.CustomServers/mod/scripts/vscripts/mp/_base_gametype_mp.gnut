@@ -12,6 +12,7 @@ global function TryGameModeAnnouncement
 
 global function SetPlayerDeathsHidden
 global function TrackTitanDamageInPlayerGameStat
+global function CheckGameStateForPlayerMovement
 
 global function ShouldEntTakeDamage_SPMP
 global function GetTitanBuildTime
@@ -23,8 +24,7 @@ struct {
 	bool playerDeathsHidden = false
 	int titanDamageGameStat = -1
 	
-	entity intermissionCamera
-	array<entity> specCams 
+	array<entity> intermissionCameras
 	
 	entity functionref( entity player, entity basePoint ) recalculateRespawnAsTitanStartPointCallback
 	table<entity, float> playerChangeTeamTimeBuffer
@@ -33,7 +33,7 @@ struct {
 void function BaseGametype_Init_MPSP()
 {
 	AddClientCommandCallback( "changeteam", ClientCommandCallbackChangeTeam )
-	AddSpawnCallback( "info_intermission", SetIntermissionCamera )
+	AddSpawnCallback( "info_intermission", AddIntermissionCamera )
 	
 	AddPostDamageCallback( "player", AddToTitanDamageStat )
 	AddPostDamageCallback( "npc_titan", AddToTitanDamageStat )
@@ -41,15 +41,24 @@ void function BaseGametype_Init_MPSP()
 	AddCallback_OnNPCKilled( CheckForAutoTitanDeath )
 	AddCallback_OnPlayerKilled( CheckForAutoTitanDeath )
 	AddCallback_OnTitanBecomesPilot( CheckGameStateForTitanEjection )
+	AddCallback_OnPlayerGetsNewPilotLoadout( CheckPlayerGetsNewLoadoutPostPlay )
 
 	RegisterSignal( "PlayerRespawnStarted" )
 	RegisterSignal( "KillCamOver" )
 	FlagInit( "WeaponDropsAllowed", true )
 }
 
-void function SetIntermissionCamera( entity camera )
+void function AddIntermissionCamera( entity camera )
 {
-	file.intermissionCamera = camera
+	file.intermissionCameras.append( camera )
+}
+
+entity function GetRandomIntermissionCamera()
+{
+	if( !file.intermissionCameras.len() )
+		return null
+	
+	return file.intermissionCameras.getrandom()
 }
 
 void function CheckServerIdlingState()
@@ -221,6 +230,7 @@ void function CodeCallback_OnClientConnectionCompleted( entity player )
 	{
 		if ( IsPrivateMatchSpectator( player ) )
 		{
+			SetPlayerEliminated( player )
 			InitialisePrivateMatchSpectatorPlayer( player )
 			return
 		}
@@ -229,11 +239,11 @@ void function CodeCallback_OnClientConnectionCompleted( entity player )
 		player.SetPersistentVar( "privateMatchState", 0 )
 
 	// handle spawning late joiners
-	if ( GetGameState() == eGameState.Playing )
+	if ( GetGameState() >= eGameState.Playing )
 	{
 		if ( SpectatePlayerDuringPickLoadout() )
 			thread SpectateTTSMenuPlayer( player )
-		else if ( RespawnsEnabled() )
+		else if ( !IsEliminationBased() )
 		{
 			if ( Riff_IsTitanAvailable( player ) || ShouldIntroSpawnAsTitan() ) //Handles the conditions to spawn player as Titan right away or not
 				thread RespawnAsTitan( player )
@@ -241,7 +251,10 @@ void function CodeCallback_OnClientConnectionCompleted( entity player )
 				RespawnAsPilot( player )
 		}
 		else
+		{
+			SetPlayerEliminated( player )
 			InitialisePrivateMatchSpectatorPlayer( player )
+		}
 	}
 }
 
@@ -251,12 +264,20 @@ void function SpectateTTSMenuPlayer( entity player )
 	OnThreadEnd(
 		function() : ( player )
 		{
-			if ( IsValid( player ) && RespawnsEnabled() )
+			if ( IsValid( player ) )
 			{
-				if ( ShouldIntroSpawnAsTitan() && Riff_TitanAvailability() != eTitanAvailability.Never )
-					thread RespawnAsTitan( player )
+				if ( !IsEliminationBased() )
+				{
+					if ( ShouldIntroSpawnAsTitan() && Riff_TitanAvailability() != eTitanAvailability.Never )
+						thread RespawnAsTitan( player )
+					else
+						RespawnAsPilot( player )
+				}
 				else
-					RespawnAsPilot( player )
+				{
+					SetPlayerEliminated( player )
+					InitialisePrivateMatchSpectatorPlayer( player )
+				}
 			}
 		}
 	)
@@ -326,9 +347,7 @@ void function CodeCallback_OnPlayerRespawned( entity player )
 		player.DissolveStop()
 	
 	player.Signal( "OnRespawned" ) // kill any postdeaththreads that could be running
-	
 	Loadouts_TryGivePilotLoadout( player )
-	//player.SetPredictionEnabled( true ) doesn't seem needed, as native code seems to set this
 	
 	foreach ( entity weapon in player.GetMainWeapons() )
 		weapon.SetProScreenOwner( player )
@@ -337,7 +356,7 @@ void function CodeCallback_OnPlayerRespawned( entity player )
 	if ( spawnAsTitan && PlayerCanSpawnIntoTitan( player ) )
 	{
 		entity titan = player.GetPetTitan()
-		player.SetOrigin( titan.GetOrigin() )
+		TeleportToEnt( player, titan )
 		PilotBecomesTitan( player, titan )
 		titan.Destroy()
 	}
@@ -347,7 +366,7 @@ void function CodeCallback_OnPlayerRespawned( entity player )
 		
 	Remote_CallFunction_NonReplay( player, "ServerCallback_YouRespawned" )
 	ClearLastAttacker( player ) // so dying to anything doesn't credit the same attacker after respawning
-	//SetHideOnCloak( player, true )
+	ClearPlayerEliminated( player )
 }
 
 
@@ -405,7 +424,7 @@ void function PostDeathThread_MP( entity player, var damageInfo ) // based on ga
 		SoulDies( player.GetTitanSoul(), damageInfo ) // cleanup some titan stuff, no idea where else to put this
 
 	ClearRespawnAvailable( player )
-
+	
 	OnThreadEnd( function() : ( player )
 	{
 		if ( !IsValid( player ) )
@@ -471,11 +490,16 @@ void function PostDeathThread_MP( entity player, var damageInfo ) // based on ga
 	float deathcamLength = GetDeathCamLength( player )
 	wait deathcamLength
 
+	player.SetPlayerSettings( "spectator" ) // prevent a crash with going from titan => pilot on respawn
+	player.StopPhysics() // need to set this after SetPlayerSettings
+	player.SetPhysics( MOVETYPE_NONE ) // so they don't move around while dead, resets to default automatically on respawn
+	
 	// use info_intermission camera after deathcam, if it exists
-	if ( file.intermissionCamera != null && !player.GetParent() )
+	entity mapCamera = GetRandomIntermissionCamera()
+	if ( mapCamera != null && !player.GetParent() )
 	{
-		player.SetObserverModeStaticPosition( file.intermissionCamera.GetOrigin() )
-		player.SetObserverModeStaticAngles( file.intermissionCamera.GetAngles() )
+		player.SetObserverModeStaticPosition( mapCamera.GetOrigin() )
+		player.SetObserverModeStaticAngles( mapCamera.GetAngles() )
 		player.StartObserverMode( OBS_MODE_STATIC_LOCKED )
 		player.SetObserverTarget( null )
 	}
@@ -485,7 +509,7 @@ void function PostDeathThread_MP( entity player, var damageInfo ) // based on ga
 	// quick note: in cases where player.Die() is called: e.g. for round ends, player == attacker
 	if ( shouldDoReplay ) 
 	{	
-		player.watchingKillreplayEndTime = Time() + replayLength		
+		player.watchingKillreplayEndTime = Time() + replayLength
 		float beforeTime = GetKillReplayBeforeTime( player, methodOfDeath )
 
 		replayTracker.validTime <- null 
@@ -497,11 +521,7 @@ void function PostDeathThread_MP( entity player, var damageInfo ) // based on ga
 		thread PlayerWatchesKillReplayWrapper( player, attacker, respawnTime, timeOfDeath, beforeTime, replayTracker )		
 	}
 
-	player.SetPlayerSettings( "spectator" ) // prevent a crash with going from titan => pilot on respawn
-	player.StopPhysics() // need to set this after SetPlayerSettings
-	player.SetPhysics( MOVETYPE_NONE ) // so they don't move around while dead, resets to default automatically on respawn
-
-	if ( RespawnsEnabled() )
+	if ( !IsEliminationBased() || IsEliminationBased() && !IsPlayerEliminated( player ) )
 	{
 		// is it a good idea to do respawn code in postdeaththread? fuck if i know lol
 		float respawnDelay = max( 0, GetCurrentPlaylistVarFloat( "respawn_delay", 0.0 ) - deathcamLength )
@@ -620,7 +640,6 @@ void function RespawnAsPilot( entity player )
 	entity spawnpoint = FindSpawnPoint( player, false, ( ShouldStartSpawn( player ) || Flag( "ForceStartSpawn" ) ) )
 	DoRespawnPlayer( player, spawnpoint )
 	player.SetAngles( spawnpoint.GetAngles() )
-	CheckGameStateAfterSpawn( player )
 	
 	//Dying as Titan and respawning as Pilot keeps the Titan Icon over the player's name instead of reverting to the normal patch such player uses
 	CallsignIcon callsignIcon = PlayerCallsignIcon_GetActive( player )
@@ -708,6 +727,7 @@ void function RespawnAsTitan( entity player, bool normalTitanfall = false )
 		camera.kv.spawnflags = 184
 		camera.kv.fov = 70
 		camera.kv.enabled = 1
+		camera.MarkAsNonMovingAttachment()
 		
 		DispatchSpawn( camera )
 		
@@ -733,8 +753,6 @@ void function RespawnAsTitan( entity player, bool normalTitanfall = false )
 
 		if( IsValid( camera ) )
 			camera.Destroy()
-		
-		CheckGameStateAfterSpawn( player )
 	})
 	
 	titan.SetOrigin( spawnpoint.GetOrigin() )
@@ -814,9 +832,12 @@ void function SetRecalculateRespawnAsTitanStartPointCallback( entity functionref
 	file.recalculateRespawnAsTitanStartPointCallback = callbackFunc
 }
 
-void function CheckGameStateAfterSpawn( entity player )
+void function CheckGameStateForPlayerMovement( entity player )
 {
-	if( GetGameState() > eGameState.Playing )
+	if( !IsAlive( player ) )
+		return
+	
+	if( GetGameState() == eGameState.WinnerDetermined || GetGameState() == eGameState.SwitchingSides || GetGameState() == eGameState.Postmatch )
 	{
 		if ( level.endOfRoundPlayerState == ENDROUND_FREEZE )
 			player.FreezeControlsOnServer()
@@ -828,9 +849,21 @@ void function CheckGameStateAfterSpawn( entity player )
 	}
 }
 
+void function CheckGameStateAfterSpawn_Threaded( entity player )
+{
+	player.EndSignal( "OnDestroy" )
+	WaitFrame()
+	CheckGameStateForPlayerMovement( player )
+}
+
 void function CheckGameStateForTitanEjection( entity pilot, entity titan )
 {
-	CheckGameStateAfterSpawn( pilot )
+	thread CheckGameStateAfterSpawn_Threaded( pilot )
+}
+
+void function CheckPlayerGetsNewLoadoutPostPlay( entity player, PilotLoadoutDef loadout )
+{
+	thread CheckGameStateAfterSpawn_Threaded( player )
 }
 
 bool function ClientCommandCallbackChangeTeam( entity player, array<string> args )
