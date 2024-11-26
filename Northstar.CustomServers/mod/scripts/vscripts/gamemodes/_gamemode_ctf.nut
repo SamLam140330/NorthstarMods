@@ -3,6 +3,10 @@ untyped
 global function CaptureTheFlag_Init
 global function RateSpawnpoints_CTF
 
+#if DEV
+global function ShowCTFInfluenceSphere
+#endif
+
 const array<string> SWAP_FLAG_MAPS = [
 	"mp_forwardbase_kodai",
 	"mp_lf_meadow"
@@ -18,8 +22,6 @@ struct {
 	array<entity> imcCaptureAssistList
 	array<entity> militiaCaptureAssistList
 } file
-
-const float CTF_FLAG_MAX_SPAWN_DISTANCE = 2000.0
 
 
 
@@ -207,6 +209,8 @@ void function RateSpawnpoints_CTF( int checkClass, array<entity> spawnpoints, in
 {
 	vector allyFlagSpot
 	vector enemyFlagSpot
+	vector flagsMedianPosition
+
 	foreach ( entity spawn in GetEntArrayByClass_Expensive( "info_spawnpoint_flag" ) )
 	{
 		if( spawn.GetTeam() == team )
@@ -214,28 +218,27 @@ void function RateSpawnpoints_CTF( int checkClass, array<entity> spawnpoints, in
 		else
 			enemyFlagSpot = spawn.GetOrigin()
 	}
-	
+
+	flagsMedianPosition = ( allyFlagSpot + enemyFlagSpot ) * 0.5
+
 	foreach ( entity spawn in spawnpoints )
 	{
-		float rating = 0.0
+		entity teamFlag = GetFlagForTeam( team )
+
 		float allyFlagDistance = Distance2D( spawn.GetOrigin(), allyFlagSpot )
 		float enemyFlagDistance = Distance2D( spawn.GetOrigin(), enemyFlagSpot )
+		float friendliesScore = spawn.NearbyAllyScore( team, "ai" ) + spawn.NearbyAllyScore( team, "titan" )  + spawn.NearbyEnemyScore( team, "pilot" )
+		float enemiesRating = spawn.NearbyEnemyScore( team, "ai" ) + spawn.NearbyEnemyScore( team, "titan" ) + spawn.NearbyEnemyScore( team, "pilot" )
+		float rating = 1.0 - ( Distance2D( spawn.GetOrigin(), allyFlagSpot ) / MAP_EXTENTS )
 		
-		if( enemyFlagDistance > allyFlagDistance )
-		{
-			rating += spawn.NearbyAllyScore( team, "ai" )
-			rating += spawn.NearbyAllyScore( team, "titan" )
-			rating += spawn.NearbyAllyScore( team, "pilot" )
-			
-			rating += spawn.NearbyEnemyScore( team, "ai" )
-			rating += spawn.NearbyEnemyScore( team, "titan" )
-			rating += spawn.NearbyEnemyScore( team, "pilot" )
+		rating += friendliesScore * 0.5
+		rating += enemiesRating
 		
-			rating = rating / allyFlagDistance
-		}
-
 		if ( spawn == player.p.lastSpawnPoint )
 			rating += GetConVarFloat( "spawnpoint_last_spawn_rating" )
+
+		if( allyFlagDistance > enemyFlagDistance ) // Prevent ratings from crossing past midpoint between flags
+			rating = 0.0
 		
 		spawn.CalculateRating( checkClass, team, rating, rating * 0.25 )
 	}
@@ -245,22 +248,16 @@ bool function VerifyCTFSpawnpoint( entity spawnpoint, int team )
 {
 	vector allyFlagSpot
 	vector enemyFlagSpot
-	foreach ( entity spawn in GetEntArrayByClass_Expensive( "info_spawnpoint_flag" ) )
+	foreach ( entity flagBase in GetEntArrayByClass_Expensive( "info_spawnpoint_flag" ) )
 	{
-		if( spawn.GetTeam() == team )
-			allyFlagSpot = spawn.GetOrigin()
+		if( flagBase.GetTeam() == team )
+			allyFlagSpot = flagBase.GetOrigin()
 		else
-			enemyFlagSpot = spawn.GetOrigin()
+			enemyFlagSpot = flagBase.GetOrigin()
 	}
 	
 	float allyFlagDistance = Distance2D( spawnpoint.GetOrigin(), allyFlagSpot )
 	float enemyFlagDistance = Distance2D( spawnpoint.GetOrigin(), enemyFlagSpot )
-
-	if( GetMapName() == "mp_drydock" || GetMapName() == "mp_thaw" ) // Restrict spawns for those two maps due to some spawns being very far away
-	{
-		if( allyFlagDistance > CTF_FLAG_MAX_SPAWN_DISTANCE )
-			return false
-	}
 	
 	if( allyFlagDistance > enemyFlagDistance )
 		return false
@@ -347,10 +344,26 @@ void function OnPlayerKilled( entity victim, entity attacker, var damageInfo )
 	if ( PlayerHasEnemyFlag( victim ) )
 	{
 		if ( victim != attacker && attacker.IsPlayer() )
-			AddPlayerScore( attacker, "FlagCarrierKill", victim )
+			AddPlayerScore( attacker, "FlagCarrierKill" )
 		
 		DropFlag( victim )
+
+		AddPlayerToAssistList( attacker )
 	}
+
+	entity flagCarrier
+	foreach ( teamMate in GetPlayerArrayOfTeam( attacker.GetTeam() ) )
+	{
+		if( PlayerHasEnemyFlag( teamMate ) )
+		{
+			flagCarrier = teamMate
+			break
+		}
+	}
+
+	// Killing players that damaged the flag carrier counts an assist for protecting the carrier
+	if( IsValidPlayer( flagCarrier ) && WasRecentlyHitByEntity( flagCarrier, victim, 5.0 ) )
+		AddPlayerToAssistList( attacker )
 }
 
 
@@ -373,7 +386,8 @@ void function OnPlayerKilled( entity victim, entity attacker, var damageInfo )
 
 bool function OnFlagCollected( entity player, entity flag )
 {
-	if ( !IsAlive( player ) || flag.GetParent() != null || FlagIngoresPlayerTitans( player ) || player.IsPhaseShifted() ) 
+	if ( !IsAlive( player ) || flag.GetParent() != null || FlagIngoresPlayerTitans( player ) ||
+	player.IsPhaseShifted() || player.p.isEmbarking || player.p.isDisembarking || player.p.pilotEjecting )
 		return false
 
 	if ( player.GetTeam() != flag.GetTeam() && flag.s.canTake )
@@ -437,7 +451,7 @@ void function CaptureFlag( entity player, entity flag )
 	SetRoundWinningKillReplayAttacker( player ) // set attacker for last cap replay
 	
 	array<entity> assistList
-	if ( player.GetTeam() == TEAM_IMC )
+	if ( team == TEAM_IMC )
 		assistList = file.imcCaptureAssistList
 	else
 		assistList = file.militiaCaptureAssistList
@@ -456,10 +470,7 @@ void function CaptureFlag( entity player, entity flag )
 		}
 	}
 	
-	if ( player.GetTeam() == TEAM_IMC )
-		file.imcCaptureAssistList.clear()
-	else
-		file.militiaCaptureAssistList.clear()
+	ClearAssistListOfOpposingTeam( TEAM_BOTH )
 
 	if( !HasPlayerCompletedMeritScore( player ) )
 		SetPlayerChallengeMeritScore( player )
@@ -479,8 +490,8 @@ void function CaptureFlag( entity player, entity flag )
 	{
 		PlayFactionDialogueToTeam( "ctf_notifyWin1more", team )
 		PlayFactionDialogueToTeam( "ctf_notifyLose1more", GetOtherTeam( team ) )
-		foreach( entity otherplayer in GetPlayerArray() )
-			Remote_CallFunction_NonReplay( otherplayer, "ServerCallback_CTF_PlayMatchNearEndMusic" )
+		foreach( entity otherPlayer in GetPlayerArray() )
+			Remote_CallFunction_NonReplay( otherPlayer, "ServerCallback_CTF_PlayMatchNearEndMusic" )
 	}
 }
 
@@ -505,10 +516,7 @@ void function DropFlag( entity player, bool realDrop = true )
 
 		flag.SetVelocity( vec )
 
-		if ( player.GetTeam() == TEAM_IMC && !file.imcCaptureAssistList.contains( player ) )
-			file.imcCaptureAssistList.append( player )
-		else if( !file.militiaCaptureAssistList.contains( player ) )
-			file.militiaCaptureAssistList.append( player )
+		AddPlayerToAssistList( player )
 
 		if( IsAlive( player ) )
 			MessageToPlayer( player, eEventNotifications.YouDroppedTheEnemyFlag )
@@ -519,7 +527,13 @@ void function DropFlag( entity player, bool realDrop = true )
 		MessageToTeam( GetOtherTeam( player.GetTeam() ), eEventNotifications.PlayerDroppedFriendlyFlag, player, player )
 	}
 	
-	thread TrackFlagDropTimeout( flag )
+	if ( IsFlagHome( flag ) )
+	{
+		ResetFlag( flag )
+		return
+	}
+	else
+		thread TrackFlagDropTimeout( flag )
 	SetFlagStateForTeam( flag.GetTeam(), eFlagState.Home )
 }
 
@@ -537,10 +551,13 @@ void function ResetFlag( entity flag )
 		flagBase = file.militiaFlagSpawn
 		
 	flag.SetOrigin( flagBase.GetOrigin() + < 0, 0, flagBase.GetBoundingMaxs().z + 1 > )
+	flag.SetVelocity( < 0, 0, 0 > )
 	
 	flag.s.canTake = true
 	
 	SetFlagStateForTeam( flag.GetTeam(), eFlagState.None )
+
+	ClearAssistListOfOpposingTeam( flag.GetTeam() )
 	
 	flag.Signal( "CTF_ReturnedFlag" )
 }
@@ -576,7 +593,7 @@ void function FlagProximityTracker( entity flag )
 				if ( IsFlagHome( flag ) || flag.GetParent() != null || player.IsPhaseShifted() )
 					continue
 				
-				if ( IsPlayerDisembarking( player ) || IsPlayerEmbarking( player ) )
+				if ( player.p.isEmbarking || player.p.isDisembarking || player.p.pilotEjecting )
 					continue
 				
 				if( playerInsidePerimeter.contains( player ) )
@@ -587,7 +604,7 @@ void function FlagProximityTracker( entity flag )
 			}
 			else
 			{
-				if( playerInsidePerimeter.contains( player ) )
+				if( playerInsidePerimeter.contains( player ) || playerInsidePerimeter.contains( player ) && player.IsPhaseShifted() )
 				{
 					player.Signal( "CTF_LeftReturnTriggerArea" ) // Cut the progress if outside range
 					playerInsidePerimeter.removebyvalue( player )
@@ -642,7 +659,8 @@ void function TryReturnFlag( entity player, entity flag )
 	EmitSoundOnEntityToTeam( flag, "UI_CTF_3P_EnemyReturnsFlag", GetOtherTeam( flag.GetTeam() ) )
 	EmitSoundOnEntityOnlyToPlayer( player, player, "UI_CTF_1P_ReturnsFlag" )
 	PlayFactionDialogueToTeam( "ctf_flagReturnedEnemy", GetOtherTeam( flag.GetTeam() ) )
-	
+	AddPlayerToAssistList( player )
+
 	ResetFlag( flag )
 	flag.Signal( "CTF_ReturnedFlag" )
 }
@@ -667,7 +685,7 @@ void function DropFlagIfPhased( entity player, entity flag )
 	{
 		if ( IsValidPlayer( player ) )
 		{
-			if ( GetGameState() == eGameState.Playing || GetGameState() == eGameState.SuddenDeath )
+			if ( GamePlayingOrSuddenDeath() )
 				DropFlag( player, true )
 		}
 	})
@@ -723,3 +741,104 @@ bool function FlagIngoresPlayerTitans( entity player )
 {
 	return GetCurrentPlaylistVarInt( "ctf_titan_flag_interaction", 0 ) == 0 && player.IsTitan()
 }
+
+
+
+
+
+
+
+
+
+
+/*
+ █████  ███████ ███████ ██ ███████ ████████ ███████     ██       ██████   ██████  ██  ██████ 
+██   ██ ██      ██      ██ ██         ██    ██          ██      ██    ██ ██       ██ ██      
+███████ ███████ ███████ ██ ███████    ██    ███████     ██      ██    ██ ██   ███ ██ ██      
+██   ██      ██      ██ ██      ██    ██         ██     ██      ██    ██ ██    ██ ██ ██      
+██   ██ ███████ ███████ ██ ███████    ██    ███████     ███████  ██████   ██████  ██  ██████ 
+*/
+
+void function AddPlayerToAssistList( entity player )
+{
+	if ( player.GetTeam() == TEAM_IMC && !file.imcCaptureAssistList.contains( player ) )
+		file.imcCaptureAssistList.append( player )
+	else if( !file.militiaCaptureAssistList.contains( player ) )
+		file.militiaCaptureAssistList.append( player )
+}
+
+void function ClearAssistListOfOpposingTeam( int team )
+{
+	switch ( team )
+	{
+		case TEAM_IMC:
+		file.militiaCaptureAssistList.clear()
+		break
+
+		case TEAM_MILITIA:
+		file.imcCaptureAssistList.clear()
+		break
+
+		case TEAM_BOTH:
+		file.militiaCaptureAssistList.clear()
+		file.imcCaptureAssistList.clear()
+		break
+	}
+}
+
+
+
+
+
+
+
+
+
+
+
+/*
+██████  ███████ ██████  ██    ██  ██████   ██████  ██ ███    ██  ██████  
+██   ██ ██      ██   ██ ██    ██ ██       ██       ██ ████   ██ ██       
+██   ██ █████   ██████  ██    ██ ██   ███ ██   ███ ██ ██ ██  ██ ██   ███ 
+██   ██ ██      ██   ██ ██    ██ ██    ██ ██    ██ ██ ██  ██ ██ ██    ██ 
+██████  ███████ ██████   ██████   ██████   ██████  ██ ██   ████  ██████  
+*/
+
+#if DEV
+void function ShowCTFInfluenceSphere()
+{
+	vector allyFlagSpot
+	vector enemyFlagSpot
+	float allyFlagDistance
+	float enemyFlagDistance
+	foreach ( entity spawn in GetEntArrayByClass_Expensive( "info_spawnpoint_flag" ) )
+	{
+		if( spawn.GetTeam() == TEAM_MILITIA )
+			allyFlagSpot = spawn.GetOrigin()
+		else
+			enemyFlagSpot = spawn.GetOrigin()
+	}
+
+	array< entity > spawnPoints = SpawnPoints_GetTitan()
+	foreach ( sPoint in spawnPoints )
+	{
+		allyFlagDistance = Distance2D( sPoint.GetOrigin(), allyFlagSpot )
+		enemyFlagDistance = Distance2D( sPoint.GetOrigin(), enemyFlagSpot )
+		if( enemyFlagDistance > allyFlagDistance )
+			DebugDrawSpawnpoint( sPoint, 255, 0, 0, false, 600 )
+		else
+			DebugDrawSpawnpoint( sPoint, 0, 0, 255, false, 600 )
+	}
+
+	spawnPoints = SpawnPoints_GetPilot()
+	foreach ( sPoint in spawnPoints )
+	{
+		allyFlagDistance = Distance2D( sPoint.GetOrigin(), allyFlagSpot )
+		enemyFlagDistance = Distance2D( sPoint.GetOrigin(), enemyFlagSpot )
+		if( enemyFlagDistance > allyFlagDistance )
+			DebugDrawSpawnpoint( sPoint, 255, 0, 0, false, 600 )
+		else
+			DebugDrawSpawnpoint( sPoint, 0, 0, 255, false, 600 )
+	}
+}
+#endif

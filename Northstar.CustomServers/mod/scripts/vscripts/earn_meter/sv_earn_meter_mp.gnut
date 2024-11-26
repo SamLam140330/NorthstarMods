@@ -50,7 +50,7 @@ void function OnPlaying()
 	foreach ( entity player in GetPlayerArray() )
 		SetupPlayerEarnMeter( player )
 
-	if ( Riff_BoostAvailability() != eBoostAvailability.Disabled )
+	if ( BurnMeterEnabled() )
 		SetCallback_EarnMeterRewardEarned( EarnMeterMP_BoostEarned )
 
 	// do this in playing so that gamemodes/maps can disable and this'll take affect
@@ -61,11 +61,17 @@ void function OnPlaying()
 	}
 
 	SetCallback_EarnMeterGoalEarned( EarnMeterMP_TitanEarned )
+
+	if( !BurnMeterEnabled() && !EarnMeterMP_IsTitanEarnGametype() )
+		PlayerEarnMeter_SetEnabled( false )
 }
 
 void function OnPlayerRespawned( entity player )
 {
-	thread EarnMeterMP_PlayerLifeThink( player )
+	if( !BurnMeterEnabled() && !EarnMeterMP_IsTitanEarnGametype() ) // If both are disabled there's no reason to show up the Earn Meter
+		PlayerEarnMeter_SetMode( player, eEarnMeterMode.DISABLED )
+	else
+		thread EarnMeterMP_PlayerLifeThink( player )
 
 	if ( PlayerEarnMeter_IsRewardAvailable( player ) )
 		EarnMeterMP_BoostEarned( player )
@@ -181,7 +187,7 @@ void function EarnMeterMP_PlayerLifeThink( entity player )
 				}
 			}
 
-			if ( Time() - lastPassiveGainTime > 4.0 && file.passiveMeterGainEnabled ) // this might be 5.0
+			if ( Time() - lastPassiveGainTime > 4.0 && file.passiveMeterGainEnabled )
 			{
 				lastPassiveGainTime = Time()
 				PlayerEarnMeter_AddOwnedFrac( player, 0.01 )
@@ -233,7 +239,7 @@ void function EarnMeterMP_SetBoostByRef( entity player, string boostRef )
 	EarnObject earnobject = EarnObject_GetByRef( boostRef )
 	BurnReward burncard = BurnReward_GetByRef( boostRef )
 
-	if ( Riff_BoostAvailability() != eBoostAvailability.Disabled )
+	if ( BurnMeterEnabled() )
 	{
 		PlayerEarnMeter_SetReward( player, earnobject ) // pretty sure this works?
 		PlayerEarnMeter_SetRewardFrac( player, burncard.cost )

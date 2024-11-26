@@ -1,7 +1,7 @@
 {
 	"Name": "Northstar.CustomServers",
 	"Description": "Attempts to recreate the behaviour of vanilla Titanfall 2 servers, as well as changing some scripts to allow better support for mods",
-	"Version": "1.28.0",
+	"Version": "1.29.0",
 	"LoadPriority": 0,
 	"ConVars": [
 		{
@@ -42,8 +42,8 @@
 			"DefaultValue": "15"
 		},
 		{
-			"Name": "ns_private_match_override_maxplayers",
-			"DefaultValue": "1"
+			"Name": "ns_maxplayers_override",
+			"DefaultValue": "0"
 		},
 		{
 			"Name": "ns_should_log_unknown_clientcommands",
@@ -64,6 +64,10 @@
 			"Flags": "REPLICATED"
 		},
 		{
+			"Name": "ns_disable_headshot_multiplier",
+			"DefaultValue": "0"
+		},
+		{
 			"Name": "ns_autobalance_teams_on_player_join",
 			"DefaultValue": "0"
 		},
@@ -81,30 +85,6 @@
 		},
 		{
 			"Name": "ns_cinematic_titanfall",
-			"DefaultValue": "0"
-		},
-		{
-			"Name": "ns_fd_min_numplayers_to_start",
-			"DefaultValue": "1"
-		},
-		{
-			"Name": "ns_fd_infantry_at_weapons",
-			"DefaultValue": ""
-		},
-		{
-			"Name": "ns_fd_grunt_primary_weapon",
-			"DefaultValue": ""
-		},
-		{
-			"Name": "ns_fd_grunt_grenade",
-			"DefaultValue": ""
-		},
-		{
-			"Name": "ns_fd_spectre_primary_weapon",
-			"DefaultValue": ""
-		},
-		{
-			"Name": "ns_fd_disable_respawn_dropship",
 			"DefaultValue": "0"
 		},
 		{
