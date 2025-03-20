@@ -51,6 +51,12 @@ void function DropshipIntro_OnClientConnected( entity player )
 
 void function OnPrematchStart()
 {
+	thread OnPrematchStart_Thread()
+}
+
+void function OnPrematchStart_Thread()
+{
+	FlagWait( "EntitiesDidLoad" )
 	ClassicMP_OnIntroStarted()
 
 	print( "Starting Dropship Intro!" )
@@ -84,7 +90,7 @@ void function OnPrematchStart()
 		table< entity, array<entity> > teamDropships = createTeam == TEAM_MILITIA ? file.militiaDropships : file.imcDropships
 		
 		if ( teamDropships.len() >= 2 )
-			break
+			continue
 
 		entity dropship = CreateDropship( createTeam, dropshipSpawn.GetOrigin(), dropshipSpawn.GetAngles() )
 		AddAnimEvent( dropship, "dropship_warpout", WarpoutEffect )
